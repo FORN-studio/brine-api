@@ -1,35 +1,35 @@
 import json
-import uuid
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Any
 from pathlib import Path
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import os
-
+import requests
+import aiohttp
 from contextlib import asynccontextmanager
-
-import torch
-from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
+from dotenv import load_dotenv
 
-# config
+load_dotenv()
+
 CONFIG = {
-    "model_path": "FORNstudio/brine", # model on huggingface
+    "model_endpoint": os.getenv("MODEL_ENDPOINT"),
+    "huggingface_token": os.getenv("HUGGINGFACE_TOKEN"),
+    "embedding_dim": 768,
     "companies_file": "companies.json",
     "batch_size": 32,
     "upload_batch_size": 500,
     "host": "0.0.0.0",
     "port": int(os.getenv("PORT", 8000)),
-    "max_workers": 2
+    "max_workers": 2,
+    "max_concurrent_requests": 500
 }
 
 
-# pydantic models for api
 class Company(BaseModel):
     id: str
     website_url: str
@@ -54,169 +54,135 @@ class SearchResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """lifespan context manager for startup and shutdown events."""
-    # startup
-    global model, qdrant_client
+    global qdrant_client, HUGGINGFACE_API_URL, HUGGINGFACE_HEADERS, EMBEDDING_DIM
     
-    # initialize model and qdrant
-    model = initialize_model()
     qdrant_client = initialize_qdrant()
     
-    # load and index companies
+    HUGGINGFACE_API_URL = CONFIG["model_endpoint"]
+    HUGGINGFACE_HEADERS = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {CONFIG['huggingface_token']}",
+        "Content-Type": "application/json" 
+    }
+    EMBEDDING_DIM = CONFIG["embedding_dim"]
+
     companies_file = CONFIG["companies_file"]
-    if Path(companies_file).exists():
-        companies = load_companies(companies_file)
-        if companies:
-            index_companies(companies)
-            print(f"API ready! Indexed {len(companies)} companies.")
-        else:
-            print("Warning: No valid companies found in the file.")
-    else:
-        print(f"Warning: {companies_file} not found. Please update CONFIG['companies_file'].")
-        print("API is running but no data is indexed.")
+    companies = load_companies(companies_file)
+    await index_companies(companies)
     
     yield
-    
-    # shutdown - no cleanup needed for in-memory qdrant
 
 
-# initialize fastapi with lifespan
 app = FastAPI(
-    title="Company Similarity API", 
-    version="0.1.0",
+    title="Brine", 
+    version="1.0.0",
     lifespan=lifespan
 )
 
-# add cors middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # allows all methods
-    allow_headers=["*"],  # allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# global variables
-model = None
 qdrant_client = None
 companies_dict = {}
 COLLECTION_NAME = "companies"
 EMBEDDING_DIM = None
-
-
-def initialize_model():
-    """initialize the sentence transformer model with gpu support if available."""
-    global model, EMBEDDING_DIM
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
-    
-    # load your fine-tuned model
-    model_path = CONFIG["model_path"]
-    try:
-        model = SentenceTransformer(model_path)
-        print(f"Loaded fine-tuned model from {model_path}")
-    except Exception as e:
-        print(f"Error loading fine-tuned model from {model_path}: {e}")
-        print("Falling back to base model...")
-        model = SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
-    
-    model = model.to(device)
-    
-    # get embedding dimension dynamically
-    EMBEDDING_DIM = model.get_sentence_embedding_dimension()
-    print(f"Model embedding dimension: {EMBEDDING_DIM}")
-    
-    return model
+HUGGINGFACE_API_URL = None
+HUGGINGFACE_HEADERS = None
 
 
 def initialize_qdrant():
-    """initialize qdrant client with in-memory storage."""
     global qdrant_client
-    # using in-memory storage for the prototype
     qdrant_client = QdrantClient(":memory:")
     
-    # create collection
     qdrant_client.create_collection(
         collection_name=COLLECTION_NAME,
-        vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE),
+        vectors_config=VectorParams(size=CONFIG.get("embedding_dim", 768), distance=Distance.COSINE),
     )
+    
     return qdrant_client
 
 
 def load_companies(file_path: str) -> List[Company]:
-    """load companies from json file."""
     with open(file_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
     
-    # handle both list and dict formats
-    if isinstance(data, dict):
-        # if it's a dict, assume companies are in a 'companies' key or values
-        if 'companies' in data:
-            company_list = data['companies']
-        else:
-            company_list = list(data.values())
-    else:
-        company_list = data
+    company_list = data
     
     companies = []
     for item in company_list:
         try:
-            # filter out companies with no description or empty description
-            if not item.get("company_description"):
+            if not item.get("company_description") or item.get("company_description") == "":
                 continue
 
             company = Company(**item)
             companies.append(company)
             companies_dict[company.id] = company
-        except Exception as e:
-            print(f"Warning: Skipping invalid company entry: {e}")
+        except Exception:
+            continue
     
     return companies
 
 
-def create_embeddings_batch(texts: List[str], batch_size: int = CONFIG["batch_size"]) -> torch.Tensor:
-    """create embeddings for texts in batches for optimal gpu utilization."""
-    
-    all_embeddings = []
-    total_batches = (len(texts) + batch_size - 1) // batch_size
-    
-    with torch.no_grad():
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i + batch_size]
-            batch_num = (i // batch_size) + 1
-            
-            # progress indicator
-            print(f"\r  Creating embeddings... batch {batch_num}/{total_batches} "
-                  f"({(batch_num/total_batches)*100:.1f}%)", end='', flush=True)
-            
-            embeddings = model.encode(
-                batch, 
-                convert_to_tensor=True, 
-                show_progress_bar=False,
-                normalize_embeddings=True  # normalize for cosine similarity
-            )
-            all_embeddings.append(embeddings)
-    
-    return torch.cat(all_embeddings, dim=0)
+async def create_single_embedding(session: aiohttp.ClientSession, semaphore: asyncio.Semaphore, text: str, index: int, total: int) -> tuple[int, List[float]]:
+    async with semaphore:
+        print(f"\r  Creating embedding {index + 1}/{total} ({((index + 1)/total)*100:.1f}%)", end='', flush=True)
+        
+        payload = {"inputs": text}
+        
+        try:
+            async with session.post(HUGGINGFACE_API_URL, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as response:
+                response.raise_for_status()
+                embedding_response = await response.json()
+                
+                if isinstance(embedding_response, dict) and 'embeddings' in embedding_response:
+                    actual_embedding = embedding_response['embeddings']
+                    if not (isinstance(actual_embedding, list) and all(isinstance(val, (float, int)) for val in actual_embedding)):
+                        raise ValueError(f"Embeddings are not a list of numbers. Got: {type(actual_embedding)}")
+                else:
+                    raise ValueError(f"Expected response format {{'embeddings': [...]}} but got: {embedding_response}")
+
+                return index, actual_embedding
+
+        except Exception as e:
+            print(f"\nBrine caught on fire ({index + 1}: {e})")
+            raise
 
 
-def index_companies(companies: List[Company]):
-    """index all companies in qdrant."""
-    print(f"Indexing {len(companies)} companies...")
+async def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
+    semaphore = asyncio.Semaphore(CONFIG["max_concurrent_requests"])
     
-    # extract descriptions for embedding
+    async with aiohttp.ClientSession(headers=HUGGINGFACE_HEADERS) as session:
+        tasks = [
+            create_single_embedding(session, semaphore, text, i, len(texts))
+            for i, text in enumerate(texts)
+        ]
+        
+        results = await asyncio.gather(*tasks)
+    
+    results.sort(key=lambda x: x[0])
+    embeddings = [result[1] for result in results]
+    
+    print("\nembeddings done")
+    return embeddings
+
+
+async def index_companies(companies: List[Company]):
+    
     descriptions = [company.company_description for company in companies]
     
-    # create embeddings in batches
-    print("Creating embeddings...")
-    embeddings = create_embeddings_batch(descriptions)
+    print("creating embeddings...")
+    embeddings = await create_embeddings_batch(descriptions)
     
-    # prepare points for qdrant
     points = []
     for i, company in enumerate(companies):
         point = PointStruct(
             id=company.id,
-            vector=embeddings[i].cpu().numpy().tolist(),
+            vector=embeddings[i],
             payload={
                 "company_name": company.company_name,
                 "website_url": company.website_url,
@@ -225,27 +191,24 @@ def index_companies(companies: List[Company]):
         )
         points.append(point)
     
-    # upload to qdrant in batches
     batch_size = CONFIG["upload_batch_size"]
-    print("Uploading to vector database...")
+    print("uploading to skynet...")
     for i in range(0, len(points), batch_size):
         batch = points[i:i + batch_size]
         qdrant_client.upsert(
             collection_name=COLLECTION_NAME,
             points=batch,
-            wait=True  # ensure write completes
+            wait=True
         )
-        print(f"  Uploaded {min(i + batch_size, len(points))}/{len(points)} companies")
+        print(f"uploaded {min(i + batch_size, len(points))}/{len(points)} companies")
     
-    print("Indexing complete!")
+    print("we made it!")
 
 
 @app.get("/health")
 async def health_check():
-    """health check endpoint for railway."""
     return {
         "status": "healthy",
-        "model_loaded": model is not None,
         "qdrant_ready": qdrant_client is not None,
         "companies_indexed": len(companies_dict)
     }
@@ -253,48 +216,52 @@ async def health_check():
 
 @app.get("/")
 async def root():
-    """root endpoint with api info."""
     return {
-        "name": "Company Similarity API",
-        "version": "0.1.0",
+        "name": "Brine",
+        "version": "1.0.0",
         "status": "ready" if len(companies_dict) > 0 else "no data indexed",
         "companies_indexed": len(companies_dict),
         "endpoints": {
             "/search": "Semantic search for companies",
             "/similar": "Find similar companies by ID",
             "/company/{company_id}": "Get company details",
-            "/company/by-index/{index}": "Get company details by internal list index",
-            "/stats": "Database statistics",
-            "/docs": "Interactive API documentation"
+            "/stats": "Basic stats",
+            "/docs": "Documentation"
         }
     }
 
 
 @app.post("/search", response_model=SearchResponse)
 async def search_companies(request: SearchRequest):
-    """semantic search for companies based on query text."""
+    if not HUGGINGFACE_API_URL or not HUGGINGFACE_HEADERS:
+        raise HTTPException(status_code=503, detail="Embedding service not configured.")
     try:
-        # encode query with normalization
-        query_embedding = model.encode(
-            request.query, 
-            convert_to_tensor=True,
-            normalize_embeddings=True
-        )
+        payload = {"inputs": request.query}
         
-        # search in qdrant
+        response = requests.post(HUGGINGFACE_API_URL, headers=HUGGINGFACE_HEADERS, json=payload, timeout=30)
+        response.raise_for_status()
+        
+        query_embedding_response = response.json()
+
+        if isinstance(query_embedding_response, dict) and 'embeddings' in query_embedding_response:
+            query_embedding = query_embedding_response['embeddings']
+            if not (isinstance(query_embedding, list) and all(isinstance(val, (float, int)) for val in query_embedding)):
+                raise ValueError(f"Query embeddings are not a list of numbers. Got: {type(query_embedding)}")
+        else:
+            raise ValueError(f"Expected response format {{'embeddings': [...]}} but got: {query_embedding_response}")
+        
         search_result = qdrant_client.search(
             collection_name=COLLECTION_NAME,
-            query_vector=query_embedding.cpu().numpy().tolist(),
+            query_vector=query_embedding,
             limit=request.limit,
-            score_threshold=0.0  # return all results, let client filter
+            score_threshold=0.0
         )
         
-        # format results
         results = []
         for hit in search_result:
             result = {
                 "id": hit.id,
-                "score": float(hit.score),  # ensure json serializable
+                "score": float(hit.score),
                 "company_name": hit.payload["company_name"],
                 "website_url": hit.payload["website_url"],
                 "description": hit.payload["description"]
@@ -309,17 +276,14 @@ async def search_companies(request: SearchRequest):
 
 @app.post("/similar")
 async def find_similar_companies(request: SimilarityRequest):
-    """find companies similar to a given company id."""
     try:
-        # check if company exists
         if request.company_id not in companies_dict:
             raise HTTPException(status_code=404, detail="Company not found")
         
-        # get the company's embedding from qdrant
         retrieved_points = qdrant_client.retrieve(
             collection_name=COLLECTION_NAME,
             ids=[request.company_id],
-            with_vectors=True  # explicitly request vectors
+            with_vectors=True
         )
         
         if not retrieved_points:
@@ -333,15 +297,12 @@ async def find_similar_companies(request: SimilarityRequest):
                 detail=f"Company ID {request.company_id} found, but has no associated vector in the index. Cannot perform similarity search."
             )
         
-        # use the retrieved vector to find similar companies
-        # we add 1 to limit because the query company itself will be in results
         search_result = qdrant_client.search(
             collection_name=COLLECTION_NAME,
-            query_vector=company_point.vector, # now guaranteed not to be none
+            query_vector=company_point.vector,
             limit=request.limit + 1
         )
         
-        # filter out the query company itself and format results
         results = []
         for hit in search_result:
             if hit.id != request.company_id:
@@ -354,7 +315,6 @@ async def find_similar_companies(request: SimilarityRequest):
                 }
                 results.append(result)
         
-        # ensure we don't exceed requested limit
         results = results[:request.limit]
         
         return {
@@ -370,25 +330,14 @@ async def find_similar_companies(request: SimilarityRequest):
 
 @app.get("/company/{company_id:str}")
 async def get_company(company_id: str):
-    """get details for a specific company."""
     if company_id not in companies_dict:
         raise HTTPException(status_code=404, detail="Company not found")
     
     return companies_dict[company_id].dict()
 
-@app.get("/company/{index:int}")
-async def get_company_by_index(index: int):
-    """get details for a specific company by index."""
-    if index >= len(companies_dict):
-        raise HTTPException(status_code=404, detail="Company not found")
-    
-    return companies_dict[list(companies_dict.keys())[index]].dict()
-
-
 
 @app.get("/stats")
 async def get_stats():
-    """get statistics about the indexed data."""
     collection_info = qdrant_client.get_collection(COLLECTION_NAME)
     
     return {

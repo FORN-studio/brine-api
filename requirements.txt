@@ -1,7 +1,6 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.7.0+cpu
 fastapi==0.115.12
 uvicorn[standard]==0.34.2
-sentence-transformers==4.1.0
 qdrant-client==1.14.2
 pydantic==2.11.5
+requests>=2.25.0
+aiohttp>=3.8.0
