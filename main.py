@@ -404,5 +404,4 @@ if __name__ == "__main__":
         host=CONFIG["host"], 
         port=CONFIG["port"],
         log_level="info",
-        reload=True
     )
