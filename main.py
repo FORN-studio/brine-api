@@ -26,7 +26,7 @@ CONFIG = {
     "host": "0.0.0.0",
     "port": int(os.getenv("PORT", 8000)),
     "max_workers": 2,
-    "max_concurrent_requests": 500
+    "max_concurrent_requests": 250
 }
 
 
